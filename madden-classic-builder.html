@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Madden Classic Builder - DraftKings Lineup Optimizer</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script crossorigin src="https://unpkg.com/recharts@2/umd/Recharts.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-font-smoothing:antialiased}
+body{font-family:'SF Mono','Fira Code','Cascadia Code',Consolas,monospace;color:#e2e8f0;background:linear-gradient(135deg,#050a18 0%,#0a1628 50%,#0d0f1a 100%);min-height:100vh}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:6px;border-radius:3px;background:#1e293b;outline:none}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:50%;background:#22d3ee;cursor:pointer;box-shadow:0 0 8px #22d3ee66}
+input[type=range]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:#22d3ee;cursor:pointer;border:none}
+.glass{background:rgba(10,22,40,0.8);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
+.glass-card{background:rgba(15,23,42,0.6);border:1px solid rgba(56,189,248,0.08);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+.glow{box-shadow:0 0 30px rgba(34,211,238,0.05)}
+.glow-border{border:1px solid rgba(34,211,238,0.2)!important;box-shadow:0 0 20px rgba(34,211,238,0.08)}
+.tab-active{background:rgba(34,211,238,0.08);border:1px solid rgba(34,211,238,0.2)}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.fade-in{animation:fadeIn 0.3s ease-out}
+@keyframes pulse-glow{0%,100%{box-shadow:0 0 20px rgba(34,211,238,0.1)}50%{box-shadow:0 0 40px rgba(34,211,238,0.2)}}
+.generating{animation:pulse-glow 2s ease-in-out infinite}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:#0f172a}
+::-webkit-scrollbar-thumb{background:#334155;border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:#475569}
+table{border-collapse:collapse}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useCallback, useMemo, useRef, useEffect } = React;
+const { AreaChart, Area, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Cell } = Recharts;
+
+// ─── Constants ───
+const SALARY_CAP = 50000;
+const SLOTS = ['QB','RB','RB','WR','WR','WR','TE','FLEX','DST'];
+const FLEX_ELIGIBLE = ['RB','WR','TE'];
+const MIN_SALARY = { QB:4000, RB:3000, WR:3000, TE:2500, DST:2500, FLEX:2500 };
+const POS_COLORS = { QB:'#fbbf24', RB:'#34d399', WR:'#38bdf8', TE:'#c084fc', DST:'#fb7185' };
+const SLOT_DEFS = [
+  {pos:'QB',pool:['QB']},{pos:'RB',pool:['RB']},{pos:'RB',pool:['RB']},
+  {pos:'WR',pool:['WR']},{pos:'WR',pool:['WR']},{pos:'WR',pool:['WR']},
+  {pos:'TE',pool:['TE']},{pos:'FLEX',pool:['RB','WR','TE']},{pos:'DST',pool:['DST']}
+];
+function gauss(){let u=0,v=0;while(!u)u=Math.random();while(!v)v=Math.random();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v)}
+
+// ─── CSV Parser ───
+function parseCSV(text){
+  const lines=text.split(/\r?\n/).map(l=>{const result=[];let cur='',inQ=false;for(let i=0;i<l.length;i++){if(l[i]==='"')inQ=!inQ;else if(l[i]===','&&!inQ){result.push(cur);cur=''}else cur+=l[i]}result.push(cur);return result});
+  const entries=[],players=[];let playerHeaderIdx=-1;
+  for(let i=0;i<lines.length;i++){
+    const row=lines[i];
+    if(i===0)continue;
+    if(row[0]&&row[0].trim()){entries.push({entryId:row[0].trim(),contestName:row[1]?.trim(),contestId:row[2]?.trim(),entryFee:row[3]?.replace('$','').trim(),currentLineup:row.slice(4,13).map(s=>s?.trim()).filter(Boolean)})}
+    if(row.length>=23&&row[14]?.trim()==='Position'){playerHeaderIdx=i;continue}
+    if(row.length>=23&&playerHeaderIdx>-1&&row[14]?.trim()&&row[14]?.trim()!=='Position'){
+      const proj=parseFloat(row[22])||0;
+      players.push({position:row[14].trim(),nameId:row[15]?.trim(),name:row[16]?.trim(),id:row[17]?.trim(),rosterPos:row[18]?.trim(),salary:parseInt(row[19])||0,gameInfo:row[20]?.trim(),team:row[21]?.trim(),projection:proj,value:proj>0&&parseInt(row[19])>0?(proj/parseInt(row[19])*1000).toFixed(2):'0.00'})
+    }
+  }
+  return {entries,players}
+}
+
+// ─── Optimal Lineup Finder ───
+function findOptimalLineup(players){
+  const viable=players.filter(p=>p.projection>0);
+  const byPos={};viable.forEach(p=>{if(!byPos[p.position])byPos[p.position]=[];byPos[p.position].push(p)});
+  Object.values(byPos).forEach(arr=>arr.sort((a,b)=>b.projection-a.projection));
+  let best=null,bestProj=0;
+  const qbs=(byPos['QB']||[]).slice(0,10),rbs=(byPos['RB']||[]).slice(0,12),wrs=(byPos['WR']||[]).slice(0,15),tes=(byPos['TE']||[]).slice(0,10),dsts=(byPos['DST']||[]).slice(0,6);
+  for(const qb of qbs){
+    for(let ri=0;ri<Math.min(rbs.length,10);ri++){
+      if(rbs[ri].id===qb.id)continue;
+      for(let rj=ri+1;rj<Math.min(rbs.length,10);rj++){
+        const rb1=rbs[ri],rb2=rbs[rj];const sal3=qb.salary+rb1.salary+rb2.salary;
+        if(sal3>SALARY_CAP-5*2500)continue;const proj3=qb.projection+rb1.projection+rb2.projection;const usedIds=new Set([qb.id,rb1.id,rb2.id]);
+        for(let wi=0;wi<Math.min(wrs.length,12);wi++){
+          if(usedIds.has(wrs[wi].id))continue;
+          for(let wj=wi+1;wj<Math.min(wrs.length,12);wj++){
+            if(usedIds.has(wrs[wj].id))continue;
+            for(let wk=wj+1;wk<Math.min(wrs.length,12);wk++){
+              if(usedIds.has(wrs[wk].id))continue;
+              const wr1=wrs[wi],wr2=wrs[wj],wr3=wrs[wk];const sal6=sal3+wr1.salary+wr2.salary+wr3.salary;
+              if(sal6>SALARY_CAP-3*2500)continue;const proj6=proj3+wr1.projection+wr2.projection+wr3.projection;
+              if(proj6+40<bestProj)continue;const usedIds2=new Set([...usedIds,wr1.id,wr2.id,wr3.id]);
+              for(const te of tes){
+                if(usedIds2.has(te.id))continue;const sal7=sal6+te.salary;if(sal7>SALARY_CAP-2*2500)continue;
+                const proj7=proj6+te.projection;if(proj7+20<bestProj)continue;
+                const flexPool=[...rbs,...wrs,...tes].filter(p=>!usedIds2.has(p.id)&&p.id!==te.id);
+                flexPool.sort((a,b)=>b.projection-a.projection);
+                for(const fl of flexPool.slice(0,8)){
+                  const sal8=sal7+fl.salary;if(sal8>SALARY_CAP-2500)continue;const proj8=proj7+fl.projection;
+                  if(proj8+8<bestProj)continue;const usedIds3=new Set([...usedIds2,te.id,fl.id]);
+                  for(const dst of dsts){
+                    if(usedIds3.has(dst.id))continue;const salF=sal8+dst.salary;if(salF>SALARY_CAP)continue;
+                    const projF=proj8+dst.projection;
+                    if(projF>bestProj){bestProj=projF;best={players:[qb,rb1,rb2,wr1,wr2,wr3,te,fl,dst],projection:projF,salary:salF}}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return best;
+}
+
+// ─── Lineup Generator ───
+function generateSingleLineup(players,noise,stacking){
+  const perturbed={};players.forEach(p=>{perturbed[p.id]=Math.max(0,p.projection+gauss()*p.projection*noise)});
+  const byPos={};players.forEach(p=>{if(!byPos[p.position])byPos[p.position]=[];byPos[p.position].push(p)});
+  const lineup=[],usedIds=new Set();let remSal=SALARY_CAP;
+  const slotsLeft=(fromIdx)=>{let min=0;for(let i=fromIdx;i<SLOT_DEFS.length;i++){min+=SLOT_DEFS[i].pos==='FLEX'?2500:MIN_SALARY[SLOT_DEFS[i].pos]||2500}return min};
+  let qbTeam=null;
+  for(let si=0;si<SLOT_DEFS.length;si++){
+    const slot=SLOT_DEFS[si];const minNeeded=slotsLeft(si+1);let pool=[];
+    for(const pos of slot.pool){if(byPos[pos])pool.push(...byPos[pos])}
+    pool=pool.filter(p=>!usedIds.has(p.id)&&p.salary<=remSal-minNeeded&&p.projection>0);
+    if(stacking?.qbWr&&si>=3&&si<=5&&qbTeam){
+      const sameTeam=pool.filter(p=>p.team===qbTeam);const hasStackAlready=lineup.some(p=>p.position==='WR'&&p.team===qbTeam);
+      if(si===5&&!hasStackAlready&&sameTeam.length>0)pool=sameTeam;
+      else if(si===3&&sameTeam.length>0&&Math.random()<0.6)pool=sameTeam;
+    }
+    if(pool.length===0)return null;
+    pool.sort((a,b)=>perturbed[b.id]/b.salary-perturbed[a.id]/a.salary);
+    const topK=Math.min(pool.length,si===0?3:4);const weights=[];
+    for(let i=0;i<topK;i++)weights.push(Math.pow(0.55,i));
+    const totalW=weights.reduce((a,b)=>a+b,0);let r=Math.random()*totalW,pick=pool[0];
+    for(let i=0;i<topK;i++){r-=weights[i];if(r<=0){pick=pool[i];break}}
+    lineup.push(pick);usedIds.add(pick.id);remSal-=pick.salary;
+    if(si===0)qbTeam=pick.team;
+  }
+  return lineup;
+}
+
+// ─── Simulator ───
+const POS_VARIANCE={QB:0.30,RB:0.35,WR:0.35,TE:0.35,DST:0.50};
+function runSimulationBatch(players,lineups,games,startSim,endSim,lineupScores){
+  for(let s=startSim;s<endSim;s++){
+    const gameFactor={};games.forEach(g=>{gameFactor[g]=1+gauss()*0.15});
+    const pScores={};players.forEach(p=>{const gf=gameFactor[p.gameInfo]||1;const posVar=POS_VARIANCE[p.position]||0.35;pScores[p.id]=Math.max(0,p.projection*gf+gauss()*p.projection*posVar)});
+    lineups.forEach((lu,li)=>{lineupScores[li].push(lu.reduce((sum,p)=>sum+pScores[p.id],0))})
+  }
+}
+function computeSimMetrics(lineups,lineupScores){
+  return lineups.map((lu,i)=>{
+    const scores=lineupScores[i].slice().sort((a,b)=>a-b);const avg=scores.reduce((a,b)=>a+b,0)/scores.length;
+    const p10=scores[Math.floor(scores.length*0.1)],p90=scores[Math.floor(scores.length*0.9)];
+    const ceil=scores[Math.floor(scores.length*0.95)],floor=scores[Math.floor(scores.length*0.05)];
+    const proj=lu.reduce((s,p)=>s+p.projection,0),sal=lu.reduce((s,p)=>s+p.salary,0);
+    return {idx:i,lineup:lu,proj,sal,avgSim:avg,floor,ceil,p10,p90}
+  })
+}
+
+// ─── Portfolio Optimizer ───
+function optimizePortfolio(simResults,entries,maxOverlap){
+  const byContest={};entries.forEach(e=>{if(!byContest[e.contestId])byContest[e.contestId]=[];byContest[e.contestId].push(e)});
+  const assignments=[];
+  Object.entries(byContest).forEach(([,contestEntries])=>{
+    const assigned=[];
+    for(const entry of contestEntries){
+      let bestIdx=-1,bestScore=-Infinity;
+      simResults.forEach((r,ri)=>{
+        if(assigned.some(a=>a.lineupIdx===ri))return;
+        let penalty=0;assigned.forEach(a=>{const overlap=r.lineup.filter(p=>a.lineup.some(ap=>ap.id===p.id)).length;if(overlap>maxOverlap)penalty+=(overlap-maxOverlap)*3});
+        const score=r.avgSim-penalty;if(score>bestScore){bestScore=score;bestIdx=ri}
+      });
+      if(bestIdx>=0){assigned.push({...simResults[bestIdx],entryId:entry.entryId,contestName:entry.contestName,lineupIdx:bestIdx});assignments.push({entry,result:simResults[bestIdx],lineupIdx:bestIdx})}
+    }
+  });
+  return assignments;
+}
+function exportCSV(portfolio){
+  let csv='Entry ID,Contest Name,Contest ID,Entry Fee,QB,RB,RB,WR,WR,WR,TE,FLEX,DST\n';
+  portfolio.forEach(({entry,result})=>{
+    const lu=result.lineup;const qb=lu.find(p=>p.position==='QB');const rbs=lu.filter(p=>p.position==='RB');const wrs=lu.filter(p=>p.position==='WR');const tes=lu.filter(p=>p.position==='TE');const dsts=lu.filter(p=>p.position==='DST');
+    const rbSlots=rbs.slice(0,2),wrSlots=wrs.slice(0,3),teSlot=tes[0],dstSlot=dsts[0];
+    const usedInMain=new Set([qb?.id,...rbSlots.map(p=>p.id),...wrSlots.map(p=>p.id),teSlot?.id,dstSlot?.id]);
+    const flex=lu.find(p=>!usedInMain.has(p.id));
+    const row=[entry.entryId,entry.contestName,entry.contestId,'$'+entry.entryFee,qb?.nameId||'',rbSlots[0]?.nameId||'',rbSlots[1]?.nameId||'',wrSlots[0]?.nameId||'',wrSlots[1]?.nameId||'',wrSlots[2]?.nameId||'',teSlot?.nameId||'',flex?.nameId||'',dstSlot?.nameId||''];
+    csv+=row.join(',')+'\n'
+  });
+  return csv;
+}
+
+// ─── UI Components ───
+function PosBadge({pos}){
+  const color=POS_COLORS[pos]||'#64748b';
+  return <span style={{display:'inline-flex',alignItems:'center',justifyContent:'center',fontSize:11,fontWeight:700,borderRadius:4,padding:'2px 6px',backgroundColor:color+'22',color,border:'1px solid '+color+'44'}}>{pos}</span>
+}
+function Stat({label,value,sub,color}){
+  return <div style={{display:'flex',flexDirection:'column'}}><span style={{fontSize:11,color:'#64748b',textTransform:'uppercase',letterSpacing:'0.05em'}}>{label}</span><span style={{fontSize:24,fontWeight:700,color:color||'#e2e8f0'}}>{value}</span>{sub&&<span style={{fontSize:11,color:'#64748b'}}>{sub}</span>}</div>
+}
+function ProgressBar({value,max,color='#22d3ee'}){
+  const pct=max>0?Math.min(100,(value/max)*100):0;
+  return <div style={{width:'100%',height:12,borderRadius:6,overflow:'hidden',background:'#1e293b'}}><div style={{height:'100%',borderRadius:6,transition:'width 0.2s',width:pct+'%',background:'linear-gradient(90deg,'+color+','+color+'cc)',boxShadow:'0 0 12px '+color+'66'}}/></div>
+}
+function Toggle({checked,onChange,label}){
+  return <label style={{display:'flex',alignItems:'center',gap:8,cursor:'pointer',userSelect:'none'}} onClick={()=>onChange(!checked)}>
+    <div style={{position:'relative',width:40,height:20}}>
+      <div style={{width:40,height:20,borderRadius:10,transition:'background 0.2s',background:checked?'#22d3ee':'#374151'}}/>
+      <div style={{position:'absolute',top:2,width:16,height:16,borderRadius:8,background:'#fff',boxShadow:'0 1px 3px rgba(0,0,0,0.3)',transition:'transform 0.2s',transform:checked?'translateX(22px)':'translateX(2px)'}}/>
+    </div>
+    <span style={{fontSize:14,color:'#d1d5db'}}>{label}</span>
+  </label>
+}
+function SliderInput({label,value,onChange,min,max,step,format,leftLabel,rightLabel}){
+  return <div><div style={{display:'flex',justifyContent:'space-between',marginBottom:8}}><label style={{fontSize:14,color:'#9ca3af'}}>{label}</label><span style={{fontSize:14,fontWeight:700,color:'#22d3ee'}}>{format?format(value):value}</span></div><input type="range" min={min} max={max} step={step} value={value} onChange={e=>onChange(parseFloat(e.target.value))} style={{width:'100%'}}/>{(leftLabel||rightLabel)&&<div style={{display:'flex',justifyContent:'space-between',fontSize:11,color:'#4b5563',marginTop:4}}><span>{leftLabel}</span><span>{rightLabel}</span></div>}</div>
+}
+
+// ─── PlayerTable ───
+function PlayerTable({players}){
+  const [sort,setSort]=useState({key:'projection',dir:'desc'});
+  const sortedPlayers=useMemo(()=>{
+    return [...players].sort((a,b)=>{
+      const av=sort.key==='salary'?a.salary:sort.key==='value'?parseFloat(a.value):a.projection;
+      const bv=sort.key==='salary'?b.salary:sort.key==='value'?parseFloat(b.value):b.projection;
+      return sort.dir==='desc'?bv-av:av-bv
+    })
+  },[players,sort]);
+  const toggleSort=key=>setSort(s=>({key,dir:s.key===key&&s.dir==='desc'?'asc':'desc'}));
+  return <div className="glass-card" style={{borderRadius:12,overflow:'hidden'}}>
+    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'12px 16px',borderBottom:'1px solid rgba(255,255,255,0.05)'}}>
+      <h3 style={{fontWeight:600,color:'#e5e7eb'}}>Player Pool</h3>
+      <div style={{display:'flex',gap:8,fontSize:12}}>
+        {['projection','salary','value'].map(k=><button key={k} onClick={()=>toggleSort(k)} style={{padding:'4px 8px',borderRadius:6,border:'none',cursor:'pointer',background:sort.key===k?'rgba(34,211,238,0.2)':'transparent',color:sort.key===k?'#67e8f9':'#6b7280',fontFamily:'inherit',fontSize:12}}>{k.charAt(0).toUpperCase()+k.slice(1)} {sort.key===k?(sort.dir==='desc'?'\u2193':'\u2191'):''}</button>)}
+      </div>
+    </div>
+    <div style={{maxHeight:384,overflowY:'auto'}}>
+      <table style={{width:'100%',fontSize:13}}>
+        <thead><tr style={{fontSize:11,color:'#6b7280',textTransform:'uppercase',background:'rgba(15,23,42,0.8)'}}>
+          <th style={{padding:'8px 16px',textAlign:'left'}}>Pos</th><th style={{padding:'8px 16px',textAlign:'left'}}>Player</th><th style={{padding:'8px 16px',textAlign:'left'}}>Team</th><th style={{padding:'8px 16px',textAlign:'right'}}>Salary</th><th style={{padding:'8px 16px',textAlign:'right'}}>Proj</th><th style={{padding:'8px 16px',textAlign:'right'}}>Value</th>
+        </tr></thead>
+        <tbody>{sortedPlayers.filter(p=>p.projection>0).map(p=><tr key={p.id} style={{borderTop:'1px solid rgba(255,255,255,0.05)'}}>
+          <td style={{padding:'8px 16px'}}><PosBadge pos={p.position}/></td>
+          <td style={{padding:'8px 16px',color:'#e5e7eb'}}>{p.name}</td>
+          <td style={{padding:'8px 16px',color:'#9ca3af'}}>{p.team}</td>
+          <td style={{padding:'8px 16px',textAlign:'right',color:'#d1d5db'}}>${p.salary.toLocaleString()}</td>
+          <td style={{padding:'8px 16px',textAlign:'right',fontWeight:700,color:POS_COLORS[p.position]}}>{p.projection.toFixed(2)}</td>
+          <td style={{padding:'8px 16px',textAlign:'right',color:'#9ca3af'}}>{p.value}</td>
+        </tr>)}</tbody>
+      </table>
+    </div>
+  </div>
+}
+
+// ─── LineupTable ───
+function LineupTable({lineups,showSimStats=false}){
+  const [page,setPage]=useState(0);const perPage=50;const totalPages=Math.ceil(lineups.length/perPage);
+  const pageData=lineups.slice(page*perPage,(page+1)*perPage);
+  return <div className="glass-card" style={{borderRadius:12,overflow:'hidden'}}>
+    <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'12px 16px',borderBottom:'1px solid rgba(255,255,255,0.05)'}}>
+      <h4 style={{fontWeight:600,color:'#e5e7eb'}}>{showSimStats?'Simulated Lineups':'Lineup Browser'}</h4>
+      <div style={{display:'flex',alignItems:'center',gap:12,fontSize:12}}>
+        <span style={{color:'#6b7280'}}>Page {page+1}/{totalPages}</span>
+        <button onClick={()=>setPage(p=>Math.max(0,p-1))} style={{padding:'4px 8px',borderRadius:6,background:'rgba(255,255,255,0.05)',color:'#9ca3af',border:'none',cursor:'pointer',fontFamily:'inherit'}}>{'\u2190'}</button>
+        <button onClick={()=>setPage(p=>Math.min(totalPages-1,p+1))} style={{padding:'4px 8px',borderRadius:6,background:'rgba(255,255,255,0.05)',color:'#9ca3af',border:'none',cursor:'pointer',fontFamily:'inherit'}}>{'\u2192'}</button>
+      </div>
+    </div>
+    <div style={{overflowX:'auto',maxHeight:320,overflowY:'auto'}}>
+      <table style={{width:'100%',fontSize:11}}>
+        <thead><tr style={{color:'#6b7280',textTransform:'uppercase',background:'rgba(15,23,42,0.8)'}}>
+          <th style={{padding:'8px 12px',textAlign:'left'}}>{showSimStats?'Rank':'#'}</th>
+          {SLOTS.map((s,i)=><th key={i} style={{padding:'8px 12px',textAlign:'left'}}>{s}</th>)}
+          <th style={{padding:'8px 12px',textAlign:'right'}}>Proj</th>
+          {showSimStats?<React.Fragment><th style={{padding:'8px 12px',textAlign:'right'}}>Sim Avg</th><th style={{padding:'8px 12px',textAlign:'right'}}>Ceil</th><th style={{padding:'8px 12px',textAlign:'right'}}>Floor</th></React.Fragment>:<th style={{padding:'8px 12px',textAlign:'right'}}>Sal</th>}
+        </tr></thead>
+        <tbody>{pageData.map((item,i)=>{
+          const lu=showSimStats?item.lineup:item;const proj=showSimStats?item.proj:lu.reduce((s,p)=>s+p.projection,0);const sal=showSimStats?item.sal:lu.reduce((s,p)=>s+p.salary,0);
+          return <tr key={i} style={{borderTop:'1px solid rgba(255,255,255,0.05)'}}>
+            <td style={{padding:'6px 12px',color:'#6b7280'}}>{page*perPage+i+1}</td>
+            {lu.map((p,j)=><td key={j} style={{padding:'6px 12px'}}><span style={{color:'#d1d5db'}}>{p.name.split(' ').pop()}</span><span style={{color:'#4b5563',marginLeft:4}}>{p.projection.toFixed(1)}</span></td>)}
+            <td style={{padding:'6px 12px',textAlign:'right',fontWeight:700,color:'#22d3ee'}}>{proj.toFixed(1)}</td>
+            {showSimStats?<React.Fragment><td style={{padding:'6px 12px',textAlign:'right',fontWeight:700,color:'#a78bfa'}}>{item.avgSim.toFixed(1)}</td><td style={{padding:'6px 12px',textAlign:'right',color:'#fbbf24'}}>{item.ceil.toFixed(1)}</td><td style={{padding:'6px 12px',textAlign:'right',color:'#6b7280'}}>{item.floor.toFixed(1)}</td></React.Fragment>:<td style={{padding:'6px 12px',textAlign:'right',color:'#9ca3af'}}>${(sal/1000).toFixed(1)}K</td>}
+          </tr>
+        })}</tbody>
+      </table>
+    </div>
+  </div>
+}
+
+// ─── Header ───
+function Header({fileName}){
+  return <header className="glass" style={{borderBottom:'1px solid rgba(56,189,248,0.1)'}}>
+    <div style={{maxWidth:1280,margin:'0 auto',padding:'12px 16px',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+      <div style={{display:'flex',alignItems:'center',gap:12}}>
+        <div style={{width:36,height:36,borderRadius:8,display:'flex',alignItems:'center',justifyContent:'center',fontSize:18,background:'linear-gradient(135deg,#22d3ee,#3b82f6)'}}>&#127918;</div>
+        <div>
+          <h1 style={{fontWeight:700,fontSize:18,letterSpacing:'-0.02em',background:'linear-gradient(90deg,#22d3ee,#a78bfa)',WebkitBackgroundClip:'text',WebkitTextFillColor:'transparent'}}>Madden Classic Builder</h1>
+          <p style={{fontSize:12,color:'#6b7280',marginTop:-2}}>DraftKings Lineup Optimization Engine</p>
+        </div>
+      </div>
+      {fileName&&<div style={{fontSize:12,color:'#6b7280',display:'flex',alignItems:'center',gap:8}}><span style={{width:8,height:8,borderRadius:4,background:'#34d399',display:'inline-block'}}/>{fileName}</div>}
+    </div>
+  </header>
+}
+
+// ─── StepNav ───
+const NAV_STEPS=[{id:'upload',label:'Upload',icon:'\uD83D\uDCC2'},{id:'configure',label:'Configure',icon:'\u2699\uFE0F'},{id:'generate',label:'Generate',icon:'\uD83D\uDD28'},{id:'simulate',label:'Simulate',icon:'\uD83C\uDFB2'},{id:'optimize',label:'Optimize',icon:'\uD83C\uDFC6'}];
+function StepNav({step,setStep}){
+  const stepIdx=NAV_STEPS.findIndex(s=>s.id===step);
+  return <nav style={{maxWidth:1280,margin:'0 auto',padding:'16px 16px 8px'}}>
+    <div style={{display:'flex',gap:4}}>
+      {NAV_STEPS.map((s,i)=><button key={s.id} onClick={()=>setStep(s.id)} style={{display:'flex',alignItems:'center',gap:8,padding:'8px 16px',borderRadius:8,fontSize:14,fontWeight:500,border:step===s.id?'1px solid rgba(34,211,238,0.2)':'1px solid transparent',background:step===s.id?'rgba(34,211,238,0.08)':'transparent',color:step===s.id?'#67e8f9':'#6b7280',cursor:'pointer',transition:'all 0.2s',fontFamily:'inherit'}}>
+        <span style={{fontSize:16}}>{s.icon}</span><span>{s.label}</span>{i<stepIdx&&<span style={{color:'#34d399',fontSize:12}}>{'\u2713'}</span>}
+      </button>)}
+    </div>
+  </nav>
+}
+
+// ─── UploadStep ───
+function UploadStep({players,entries,fileName,optimalLineup,findingOptimal,onFile,onNext}){
+  const fileRef=useRef(null);
+  const handleFile=(file)=>{if(!file)return;const reader=new FileReader();reader.onload=e=>onFile(file.name,e.target.result);reader.readAsText(file)};
+  const onClick=()=>fileRef.current?.click();
+  const onDragOver=e=>{e.preventDefault();e.stopPropagation()};
+  const onDrop=e=>{e.preventDefault();e.stopPropagation();const f=e.dataTransfer?.files?.[0];if(f)handleFile(f)};
+  const onChange=e=>{const f=e.target.files?.[0];if(f)handleFile(f)};
+
+  return <div className="fade-in" style={{display:'flex',flexDirection:'column',gap:24}}>
+    <div className="glass-card glow" style={{borderRadius:16,padding:32,textAlign:'center',cursor:'pointer',transition:'all 0.2s'}} onClick={onClick} onDragOver={onDragOver} onDrop={onDrop}>
+      <input ref={fileRef} type="file" accept=".csv" className="hidden" onChange={onChange}/>
+      <div style={{fontSize:48,marginBottom:16}}>{players.length?'\u2705':'\uD83D\uDCC1'}</div>
+      <p style={{fontWeight:600,fontSize:18,color:'#e5e7eb'}}>{players.length?'File Loaded Successfully':'Drop DraftKings CSV Here'}</p>
+      <p style={{fontSize:14,color:'#6b7280',marginTop:4}}>{players.length?players.length+' players \u00B7 '+entries.length+' entries':'or click to browse'}</p>
+    </div>
+
+    {players.length>0&&<React.Fragment>
+      <div style={{display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:12}}>
+        {Object.entries(POS_COLORS).map(([pos,color])=>{
+          const count=players.filter(p=>p.position===pos).length;const viable=players.filter(p=>p.position===pos&&p.projection>0).length;
+          return <div key={pos} className="glass-card" style={{borderRadius:12,padding:16}}>
+            <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:4}}><div style={{width:12,height:12,borderRadius:6,background:color}}/><span style={{fontWeight:700,color}}>{pos}</span></div>
+            <p style={{fontSize:24,fontWeight:700,color:'#fff'}}>{viable}</p>
+            <p style={{fontSize:12,color:'#6b7280'}}>{count-viable} zero-proj</p>
+          </div>
+        })}
+      </div>
+
+      <div className="glass-card" style={{borderRadius:12,padding:16}}>
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:12}}>
+          <h3 style={{fontWeight:600,color:'#e5e7eb'}}>Contest Entries</h3>
+          <span style={{fontSize:12,color:'#6b7280'}}>{entries.length} entries</span>
+        </div>
+        <div style={{display:'flex',flexDirection:'column',gap:8}}>
+          {entries.map((e,i)=><div key={i} style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'8px 12px',borderRadius:8,background:'rgba(255,255,255,0.05)'}}>
+            <span style={{fontSize:14,color:'#d1d5db',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',flex:1}}>{e.contestName}</span>
+            <span style={{fontSize:14,fontWeight:700,color:'#22d3ee',marginLeft:16}}>${e.entryFee}</span>
+          </div>)}
+        </div>
+      </div>
+
+      {optimalLineup&&<div className="glass-card glow-border" style={{borderRadius:12,padding:16}}>
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:12}}>
+          <h3 style={{fontWeight:600,color:'#67e8f9'}}>{'\u26A1'} Optimal Lineup Found</h3>
+          <div style={{textAlign:'right'}}><span style={{fontSize:24,fontWeight:700,color:'#22d3ee'}}>{optimalLineup.projection.toFixed(2)}</span><span style={{fontSize:12,color:'#6b7280',marginLeft:8}}>pts · ${optimalLineup.salary.toLocaleString()}</span></div>
+        </div>
+        <div style={{display:'flex',flexWrap:'wrap',gap:8}}>
+          {optimalLineup.players.map((p,i)=><div key={i} style={{display:'flex',alignItems:'center',gap:8,padding:'6px 12px',borderRadius:8,background:'rgba(255,255,255,0.05)',fontSize:14}}>
+            <PosBadge pos={p.position}/><span style={{color:'#e5e7eb'}}>{p.name}</span><span style={{color:'#6b7280'}}>{p.projection.toFixed(1)}</span>
+          </div>)}
+        </div>
+      </div>}
+
+      {findingOptimal&&<div className="glass-card" style={{borderRadius:12,padding:24,textAlign:'center'}}><div style={{fontSize:24,marginBottom:8}}>{'\uD83D\uDD0D'}</div><p style={{color:'#9ca3af'}}>Finding optimal lineup...</p></div>}
+
+      <PlayerTable players={players}/>
+
+      <button onClick={onNext} style={{width:'100%',padding:12,borderRadius:12,fontWeight:700,fontSize:18,border:'none',cursor:'pointer',background:'linear-gradient(135deg,#22d3ee,#3b82f6)',color:'#050a18',fontFamily:'inherit',transition:'transform 0.2s'}}>Continue to Configure {'\u2192'}</button>
+    </React.Fragment>}
+  </div>
+}
+
+// ─── ConfigureStep ───
+function ConfigureStep({settings,setSettings,optimalLineup,projFloor,onNext}){
+  const set=key=>val=>setSettings(s=>({...s,[key]:val}));
+  return <div className="fade-in" style={{display:'flex',flexDirection:'column',gap:24}}>
+    <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:24}}>
+      <div className="glass-card glow" style={{borderRadius:16,padding:24,display:'flex',flexDirection:'column',gap:24}}>
+        <h3 style={{fontWeight:700,fontSize:18,color:'#f3f4f6'}}>Lineup Generation</h3>
+        <div>
+          <div style={{display:'flex',justifyContent:'space-between',marginBottom:8}}><label style={{fontSize:14,color:'#9ca3af'}}>Lineup Count</label><span style={{fontSize:14,fontWeight:700,color:'#22d3ee'}}>{settings.lineupCount.toLocaleString()}</span></div>
+          <div style={{display:'flex',gap:8}}>
+            {[2000,5000,10000,25000,50000].map(n=><button key={n} onClick={()=>set('lineupCount')(n)} style={{flex:1,padding:'8px 0',borderRadius:8,fontSize:12,fontWeight:700,border:settings.lineupCount===n?'1px solid rgba(34,211,238,0.4)':'1px solid transparent',background:settings.lineupCount===n?'rgba(34,211,238,0.2)':'rgba(255,255,255,0.05)',color:settings.lineupCount===n?'#67e8f9':'#6b7280',cursor:'pointer',fontFamily:'inherit',transition:'all 0.2s'}}>{n>=1000?(n/1000)+'K':n}</button>)}
+          </div>
+        </div>
+        <SliderInput label="Projection Floor" value={settings.floorPct} onChange={set('floorPct')} min={90} max={98} step={0.5} format={v=>v+'%'+(optimalLineup?' (\u2265 '+(optimalLineup.projection*v/100).toFixed(1)+' pts)':'')} leftLabel="90% (diverse)" rightLabel="98% (tight)"/>
+        <SliderInput label="Randomization" value={settings.noiseFactor*100} onChange={v=>set('noiseFactor')(v/100)} min={10} max={60} step={1} format={v=>v.toFixed(0)+'%'} leftLabel="10% (chalk)" rightLabel="60% (volatile)"/>
+        <SliderInput label="Min Salary Used" value={settings.minSalary} onChange={set('minSalary')} min={46000} max={50000} step={500} format={v=>'$'+v.toLocaleString()}/>
+      </div>
+      <div style={{display:'flex',flexDirection:'column',gap:24}}>
+        <div className="glass-card glow" style={{borderRadius:16,padding:24,display:'flex',flexDirection:'column',gap:20}}>
+          <h3 style={{fontWeight:700,fontSize:18,color:'#f3f4f6'}}>Stacking Rules</h3>
+          <Toggle checked={settings.qbWrStack} onChange={set('qbWrStack')} label="QB + WR same team"/>
+          <Toggle checked={settings.bringBack} onChange={set('bringBack')} label="Bring-back (opposing player)"/>
+        </div>
+        <div className="glass-card glow" style={{borderRadius:16,padding:24,display:'flex',flexDirection:'column',gap:20}}>
+          <h3 style={{fontWeight:700,fontSize:18,color:'#f3f4f6'}}>Simulation</h3>
+          <div>
+            <div style={{display:'flex',justifyContent:'space-between',marginBottom:8}}><label style={{fontSize:14,color:'#9ca3af'}}>Simulations</label><span style={{fontSize:14,fontWeight:700,color:'#22d3ee'}}>{settings.simCount.toLocaleString()}</span></div>
+            <div style={{display:'flex',gap:8}}>
+              {[500,1000,2500,5000].map(n=><button key={n} onClick={()=>set('simCount')(n)} style={{flex:1,padding:'8px 0',borderRadius:8,fontSize:12,fontWeight:700,border:settings.simCount===n?'1px solid rgba(34,211,238,0.4)':'1px solid transparent',background:settings.simCount===n?'rgba(34,211,238,0.2)':'rgba(255,255,255,0.05)',color:settings.simCount===n?'#67e8f9':'#6b7280',cursor:'pointer',fontFamily:'inherit'}}>{n>=1000?(n/1000)+'K':n}</button>)}
+            </div>
+          </div>
+          <SliderInput label="Max Player Overlap (Portfolio)" value={settings.overlapPenalty} onChange={set('overlapPenalty')} min={2} max={7} step={1} leftLabel="2 (aggressive)" rightLabel="7 (relaxed)"/>
+        </div>
+        {optimalLineup&&<div className="glass-card" style={{borderRadius:12,padding:16}}>
+          <div style={{display:'flex',alignItems:'center',gap:12}}>
+            <div style={{fontSize:30}}>{'\u26A1'}</div>
+            <div><p style={{fontSize:11,color:'#6b7280',textTransform:'uppercase',letterSpacing:'0.05em'}}>Optimal Projection</p><p style={{fontSize:24,fontWeight:700,color:'#22d3ee'}}>{optimalLineup.projection.toFixed(2)}</p></div>
+            <div style={{marginLeft:'auto',textAlign:'right'}}><p style={{fontSize:11,color:'#6b7280',textTransform:'uppercase',letterSpacing:'0.05em'}}>Floor ({settings.floorPct}%)</p><p style={{fontSize:24,fontWeight:700,color:'#fbbf24'}}>{projFloor.toFixed(2)}</p></div>
+          </div>
+        </div>}
+      </div>
+    </div>
+    <button onClick={onNext} style={{width:'100%',padding:12,borderRadius:12,fontWeight:700,fontSize:18,border:'none',cursor:'pointer',background:'linear-gradient(135deg,#22d3ee,#3b82f6)',color:'#050a18',fontFamily:'inherit'}}>Continue to Generate {'\u2192'}</button>
+  </div>
+}
+
+// ─── GenerateStep ───
+function GenerateStep({players,settings,optimalLineup,projFloor,lineups,setLineups,generating,setGenerating,genProgress,setGenProgress,onNext}){
+  const cancelRef=useRef(false);
+
+  const startGeneration=useCallback(()=>{
+    if(!optimalLineup)return;
+    setGenerating(true);setLineups([]);setGenProgress({count:0,attempts:0});cancelRef.current=false;
+    const viablePlayers=players.filter(p=>p.projection>0);
+    const target=settings.lineupCount;const floor=optimalLineup.projection*settings.floorPct/100;const noise=settings.noiseFactor;const minSal=settings.minSalary;const stacking={qbWr:settings.qbWrStack};
+    const result=[];let attempts=0;const BATCH=200;
+    function batch(){
+      if(cancelRef.current){setGenerating(false);return}
+      for(let b=0;b<BATCH&&result.length<target;b++){
+        attempts++;const lu=generateSingleLineup(viablePlayers,noise,stacking);
+        if(!lu)continue;const proj=lu.reduce((s,p)=>s+p.projection,0);const sal=lu.reduce((s,p)=>s+p.salary,0);
+        if(proj>=floor&&sal>=minSal)result.push(lu);
+      }
+      setGenProgress({count:result.length,attempts});
+      if(result.length>=target){setLineups([...result]);setGenerating(false)}else{setTimeout(batch,0)}
+    }
+    setTimeout(batch,0);
+  },[optimalLineup,players,settings]);
+
+  const handleCancel=useCallback(()=>{cancelRef.current=true;setGenerating(false)},[]);
+
+  const exposure=useMemo(()=>{
+    if(!lineups.length)return[];const counts={};lineups.forEach(lu=>lu.forEach(p=>{counts[p.id]=(counts[p.id]||0)+1}));
+    return players.filter(p=>counts[p.id]).map(p=>({name:p.name,position:p.position,exposure:((counts[p.id]||0)/lineups.length*100).toFixed(1),count:counts[p.id]||0})).sort((a,b)=>b.count-a.count)
+  },[lineups,players]);
+
+  const projDistribution=useMemo(()=>{
+    if(!lineups.length)return[];const projs=lineups.map(lu=>lu.reduce((s,p)=>s+p.projection,0));
+    const min=Math.floor(Math.min(...projs)),max=Math.ceil(Math.max(...projs));const step=Math.max(0.5,(max-min)/30);const buckets={};
+    projs.forEach(p=>{const b=(Math.floor(p/step)*step).toFixed(1);buckets[b]=(buckets[b]||0)+1});
+    return Object.entries(buckets).map(([k,v])=>({proj:parseFloat(k),count:v})).sort((a,b)=>a.proj-b.proj)
+  },[lineups]);
+
+  const sortedLineups=useMemo(()=>[...lineups].sort((a,b)=>b.reduce((s,p)=>s+p.projection,0)-a.reduce((s,p)=>s+p.projection,0)),[lineups]);
+
+  return <div className="fade-in" style={{display:'flex',flexDirection:'column',gap:24}}>
+    {!lineups.length&&!generating&&<div className="glass-card glow" style={{borderRadius:16,padding:32,textAlign:'center'}}>
+      <div style={{fontSize:48,marginBottom:16}}>{'\uD83D\uDD28'}</div>
+      <h3 style={{fontWeight:700,fontSize:20,color:'#f3f4f6',marginBottom:8}}>Ready to Build {settings.lineupCount.toLocaleString()} Lineups</h3>
+      <p style={{color:'#6b7280',marginBottom:8}}>Floor: {projFloor.toFixed(1)} pts ({settings.floorPct}% of optimal {optimalLineup?.projection.toFixed(1)})</p>
+      <p style={{color:'#4b5563',fontSize:14,marginBottom:24}}>Noise: {(settings.noiseFactor*100).toFixed(0)}% · Min Salary: ${settings.minSalary.toLocaleString()} · Stacking: {settings.qbWrStack?'QB+WR':'Off'}</p>
+      <button onClick={startGeneration} style={{padding:'12px 32px',borderRadius:12,fontWeight:700,fontSize:18,border:'none',cursor:'pointer',background:'linear-gradient(135deg,#22d3ee,#3b82f6)',color:'#050a18',fontFamily:'inherit',transition:'transform 0.2s'}}>Generate Lineups</button>
+    </div>}
+
+    {generating&&<div className="glass-card glow generating" style={{borderRadius:16,padding:32,textAlign:'center'}}>
+      <div style={{fontSize:48,marginBottom:16}}>{'\u26A1'}</div>
+      <h3 style={{fontWeight:700,fontSize:20,color:'#67e8f9',marginBottom:16}}>Building Lineups...</h3>
+      <div style={{maxWidth:512,margin:'0 auto',marginBottom:16}}><ProgressBar value={genProgress.count} max={settings.lineupCount}/></div>
+      <div style={{display:'flex',justifyContent:'center',gap:32,marginBottom:16}}>
+        <Stat label="Valid Lineups" value={genProgress.count.toLocaleString()} color="#22d3ee"/>
+        <Stat label="Attempts" value={genProgress.attempts.toLocaleString()} color="#94a3b8"/>
+        <Stat label="Hit Rate" value={genProgress.attempts>0?((genProgress.count/genProgress.attempts)*100).toFixed(1)+'%':'\u2014'} color="#34d399"/>
+      </div>
+      <button onClick={handleCancel} style={{padding:'8px 24px',borderRadius:8,fontSize:14,fontWeight:600,background:'rgba(239,68,68,0.2)',color:'#f87171',border:'1px solid rgba(239,68,68,0.3)',cursor:'pointer',fontFamily:'inherit'}}>Cancel</button>
+    </div>}
+
+    {lineups.length>0&&!generating&&<React.Fragment>
+      <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:16}}>
+        <div className="glass-card" style={{borderRadius:12,padding:16}}><Stat label="Lineups Built" value={lineups.length.toLocaleString()} color="#22d3ee"/></div>
+        <div className="glass-card" style={{borderRadius:12,padding:16}}><Stat label="Avg Projection" value={(lineups.reduce((s,lu)=>s+lu.reduce((a,p)=>a+p.projection,0),0)/lineups.length).toFixed(2)} color="#34d399"/></div>
+        <div className="glass-card" style={{borderRadius:12,padding:16}}><Stat label="Max Projection" value={Math.max(...lineups.map(lu=>lu.reduce((s,p)=>s+p.projection,0))).toFixed(2)} color="#fbbf24"/></div>
+        <div className="glass-card" style={{borderRadius:12,padding:16}}><Stat label="Unique Players" value={new Set(lineups.flat().map(p=>p.id)).size} color="#c084fc"/></div>
+      </div>
+
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:24}}>
+        <div className="glass-card" style={{borderRadius:12,padding:16}}>
+          <h4 style={{fontWeight:600,color:'#d1d5db',marginBottom:12}}>Projection Distribution</h4>
+          <ResponsiveContainer width="100%" height={200}>
+            <AreaChart data={projDistribution}>
+              <defs><linearGradient id="projGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#22d3ee" stopOpacity={0.4}/><stop offset="100%" stopColor="#22d3ee" stopOpacity={0}/></linearGradient></defs>
+              <CartesianGrid strokeDasharray="3 3" stroke="#1e293b"/>
+              <XAxis dataKey="proj" tick={{fill:'#64748b',fontSize:10}}/>
+              <YAxis tick={{fill:'#64748b',fontSize:10}}/>
+              <Tooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:8,color:'#e2e8f0'}}/>
+              <Area type="monotone" dataKey="count" stroke="#22d3ee" fill="url(#projGrad)" strokeWidth={2}/>
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+        <div className="glass-card" style={{borderRadius:12,padding:16}}>
+          <h4 style={{fontWeight:600,color:'#d1d5db',marginBottom:12}}>Top Player Exposure</h4>
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={exposure.slice(0,12)} layout="vertical">
+              <CartesianGrid strokeDasharray="3 3" stroke="#1e293b"/>
+              <XAxis type="number" tick={{fill:'#64748b',fontSize:10}} unit="%"/>
+              <YAxis type="category" dataKey="name" tick={{fill:'#94a3b8',fontSize:10}} width={100}/>
+              <Tooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:8,color:'#e2e8f0'}} formatter={v=>[v+'%','Exposure']}/>
+              <Bar dataKey="exposure" radius={[0,4,4,0]}>{exposure.slice(0,12).map((e,i)=><Cell key={i} fill={POS_COLORS[e.position]||'#64748b'} fillOpacity={0.7}/>)}</Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      <LineupTable lineups={sortedLineups}/>
+      <button onClick={onNext} style={{width:'100%',padding:12,borderRadius:12,fontWeight:700,fontSize:18,border:'none',cursor:'pointer',background:'linear-gradient(135deg,#22d3ee,#3b82f6)',color:'#050a18',fontFamily:'inherit'}}>Continue to Simulate {'\u2192'}</button>
+    </React.Fragment>}
+  </div>
+}
+
+// ─── SimulateStep ───
+function SimulateStep({players,lineups,settings,simResults,setSimResults,simulating,setSimulating,simProgress,setSimProgress,onNext}){
+  const cancelRef=useRef(false);
+
+  const startSimulation=useCallback(()=>{
+    if(!lineups.length)return;
+    setSimulating(true);setSimProgress(0);cancelRef.current=false;
+    const games=[...new Set(players.map(p=>p.gameInfo).filter(Boolean))];
+    const lineupScores=lineups.map(()=>[]);
+    const total=settings.simCount;const BATCH=50;let done=0;
+    function batch(){
+      if(cancelRef.current){setSimulating(false);return}
+      const end=Math.min(done+BATCH,total);
+      runSimulationBatch(players,lineups,games,done,end,lineupScores);
+      done=end;setSimProgress((done/total)*100);
+      if(done>=total){
+        const metrics=computeSimMetrics(lineups,lineupScores);
+        metrics.sort((a,b)=>b.avgSim-a.avgSim);
+        setSimResults(metrics);setSimulating(false);
+      }else{setTimeout(batch,0)}
+    }
+    setTimeout(batch,0);
+  },[lineups,players,settings.simCount]);
+
+  const handleCancel=useCallback(()=>{cancelRef.current=true;setSimulating(false)},[]);
+
+  return <div className="fade-in" style={{display:'flex',flexDirection:'column',gap:24}}>
+    {!simResults&&!simulating&&<div className="glass-card glow" style={{borderRadius:16,padding:32,textAlign:'center'}}>
+      <div style={{fontSize:48,marginBottom:16}}>{'\uD83C\uDFB2'}</div>
+      <h3 style={{fontWeight:700,fontSize:20,color:'#f3f4f6',marginBottom:8}}>Monte Carlo Contest Simulation</h3>
+      <p style={{color:'#6b7280',marginBottom:24}}>{settings.simCount.toLocaleString()} simulations × {lineups.length.toLocaleString()} lineups</p>
+      <button onClick={startSimulation} style={{padding:'12px 32px',borderRadius:12,fontWeight:700,fontSize:18,border:'none',cursor:'pointer',background:'linear-gradient(135deg,#a78bfa,#7c3aed)',color:'#fff',fontFamily:'inherit'}}>Run Simulation</button>
+    </div>}
+
+    {simulating&&<div className="glass-card glow generating" style={{borderRadius:16,padding:32,textAlign:'center'}}>
+      <div style={{fontSize:48,marginBottom:16}}>{'\uD83C\uDFB2'}</div>
+      <h3 style={{fontWeight:700,fontSize:20,color:'#c4b5fd',marginBottom:16}}>Simulating Outcomes...</h3>
+      <div style={{maxWidth:512,margin:'0 auto',marginBottom:16}}><ProgressBar value={simProgress} max={100} color="#a78bfa"/></div>
+      <p style={{color:'#9ca3af',marginBottom:16}}>{simProgress.toFixed(0)}% complete</p>
+      <button onClick={handleCancel} style={{padding:'8px 24px',borderRadius:8,fontSize:14,fontWeight:600,background:'rgba(239,68,68,0.2)',color:'#f87171',border:'1px solid rgba(239,68,68,0.3)',cursor:'pointer',fontFamily:'inherit'}}>Cancel</button>
+    </div>}
+
+    {simResults&&<React.Fragment>
+      <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:16}}>
+        <div className="glass-card" style={{borderRadius:12,padding:16}}><Stat label="Best Avg Sim" value={simResults[0]?.avgSim.toFixed(2)} color="#a78bfa"/></div>
+        <div className="glass-card" style={{borderRadius:12,padding:16}}><Stat label="Best Ceiling" value={Math.max(...simResults.map(r=>r.ceil)).toFixed(2)} color="#fbbf24"/></div>
+        <div className="glass-card" style={{borderRadius:12,padding:16}}><Stat label="Best Floor" value={Math.max(...simResults.map(r=>r.floor)).toFixed(2)} color="#34d399"/></div>
+        <div className="glass-card" style={{borderRadius:12,padding:16}}><Stat label="Avg Spread" value={(simResults.reduce((s,r)=>s+(r.p90-r.p10),0)/simResults.length).toFixed(2)} color="#fb7185" sub="P90 - P10"/></div>
+      </div>
+
+      <div className="glass-card" style={{borderRadius:12,padding:16}}>
+        <h4 style={{fontWeight:600,color:'#d1d5db',marginBottom:12}}>Simulated Score Distribution (Top 50 Lineups)</h4>
+        <ResponsiveContainer width="100%" height={250}>
+          <BarChart data={simResults.slice(0,50).map((r,i)=>({idx:i+1,avg:parseFloat(r.avgSim.toFixed(1)),floor:parseFloat(r.floor.toFixed(1)),ceil:parseFloat(r.ceil.toFixed(1))}))}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#1e293b"/>
+            <XAxis dataKey="idx" tick={{fill:'#64748b',fontSize:10}}/>
+            <YAxis tick={{fill:'#64748b',fontSize:10}}/>
+            <Tooltip contentStyle={{background:'#0f172a',border:'1px solid #334155',borderRadius:8,color:'#e2e8f0'}}/>
+            <Bar dataKey="floor" fill="#334155" radius={[2,2,0,0]} name="Floor (P5)"/>
+            <Bar dataKey="avg" fill="#a78bfa" radius={[2,2,0,0]} name="Avg Sim"/>
+            <Bar dataKey="ceil" fill="#fbbf24" radius={[2,2,0,0]} name="Ceiling (P95)"/>
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+
+      <LineupTable lineups={simResults.slice(0,100)} showSimStats={true}/>
+      <button onClick={onNext} style={{width:'100%',padding:12,borderRadius:12,fontWeight:700,fontSize:18,border:'none',cursor:'pointer',background:'linear-gradient(135deg,#fbbf24,#f59e0b)',color:'#050a18',fontFamily:'inherit'}}>Optimize Portfolio & Export {'\u2192'}</button>
+    </React.Fragment>}
+  </div>
+}
+
+// ─── OptimizeStep ───
+function OptimizeStep({simResults,entries,settings,portfolio,setPortfolio}){
+  const startOptimization=useCallback(()=>{
+    if(!simResults||!entries.length)return;
+    const result=optimizePortfolio(simResults,entries,settings.overlapPenalty);
+    setPortfolio(result);
+  },[simResults,entries,settings.overlapPenalty]);
+
+  const handleExport=useCallback(()=>{
+    if(!portfolio)return;const csv=exportCSV(portfolio);const blob=new Blob([csv],{type:'text/csv'});const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download='DKEntries_Optimized_'+new Date().toISOString().slice(0,10)+'.csv';a.click();URL.revokeObjectURL(url);
+  },[portfolio]);
+
+  useEffect(()=>{if(!portfolio&&simResults&&entries.length)startOptimization()},[portfolio,simResults,entries]);
+
+  return <div className="fade-in" style={{display:'flex',flexDirection:'column',gap:24}}>
+    {!portfolio&&<div className="glass-card glow generating" style={{borderRadius:16,padding:32,textAlign:'center'}}>
+      <div style={{fontSize:48,marginBottom:16}}>{'\uD83C\uDFC6'}</div>
+      <h3 style={{fontWeight:700,fontSize:20,color:'#fcd34d'}}>Optimizing Portfolio...</h3>
+    </div>}
+
+    {portfolio&&<React.Fragment>
+      <div className="glass-card glow-border" style={{borderRadius:16,padding:24}}>
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:16}}>
+          <h3 style={{fontWeight:700,fontSize:20,color:'#f3f4f6'}}>Portfolio Assignments</h3>
+          <button onClick={handleExport} style={{display:'flex',alignItems:'center',gap:8,padding:'10px 20px',borderRadius:12,fontWeight:700,border:'none',cursor:'pointer',background:'linear-gradient(135deg,#34d399,#10b981)',color:'#050a18',fontFamily:'inherit',transition:'transform 0.2s'}}>{'\uD83D\uDCE5'} Export CSV</button>
+        </div>
+        <div style={{display:'flex',flexDirection:'column',gap:16}}>
+          {portfolio.map((a,i)=>{
+            const overlap=i>0?a.result.lineup.filter(p=>portfolio.slice(0,i).some(prev=>prev.result.lineup.some(pp=>pp.id===p.id))).length:0;
+            return <div key={i} className="glass-card" style={{borderRadius:12,padding:16}}>
+              <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:12}}>
+                <div><span style={{fontSize:11,color:'#6b7280',textTransform:'uppercase',letterSpacing:'0.05em'}}>Entry {i+1}</span><p style={{fontSize:14,color:'#d1d5db',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{a.entry.contestName}</p><span style={{fontSize:12,color:'#22d3ee'}}>${a.entry.entryFee}</span></div>
+                <div style={{textAlign:'right'}}><p style={{fontSize:18,fontWeight:700,color:'#a78bfa'}}>{a.result.avgSim.toFixed(2)}</p><p style={{fontSize:12,color:'#6b7280'}}>proj: {a.result.proj.toFixed(1)} · ceil: {a.result.ceil.toFixed(1)}</p></div>
+              </div>
+              <div style={{display:'flex',flexWrap:'wrap',gap:8,marginBottom:8}}>
+                {a.result.lineup.map((p,j)=>{
+                  const inOther=i>0&&portfolio.slice(0,i).some(prev=>prev.result.lineup.some(pp=>pp.id===p.id));
+                  return <div key={j} style={{display:'flex',alignItems:'center',gap:6,padding:'4px 8px',borderRadius:8,fontSize:12,background:inOther?'rgba(245,158,11,0.1)':'rgba(255,255,255,0.05)',border:inOther?'1px solid rgba(245,158,11,0.3)':'1px solid transparent'}}>
+                    <PosBadge pos={p.position}/><span style={{color:'#e5e7eb'}}>{p.name}</span><span style={{color:'#6b7280'}}>${(p.salary/1000).toFixed(1)}K</span>
+                  </div>
+                })}
+              </div>
+              {i>0&&<div style={{fontSize:12,color:'#6b7280'}}>{overlap} player{overlap!==1?'s':''} shared with previous entries {overlap>settings.overlapPenalty?'\u26A0\uFE0F':'\u2713'}</div>}
+            </div>
+          })}
+        </div>
+      </div>
+
+      <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:16}}>
+        <div className="glass-card" style={{borderRadius:12,padding:16}}><Stat label="Total Entry Fees" value={'$'+portfolio.reduce((s,a)=>s+parseFloat(a.entry.entryFee),0).toFixed(0)} color="#fb7185"/></div>
+        <div className="glass-card" style={{borderRadius:12,padding:16}}><Stat label="Avg Portfolio Sim" value={(portfolio.reduce((s,a)=>s+a.result.avgSim,0)/portfolio.length).toFixed(2)} color="#a78bfa"/></div>
+        <div className="glass-card" style={{borderRadius:12,padding:16}}><Stat label="Portfolio Diversity" value={new Set(portfolio.flatMap(a=>a.result.lineup.map(p=>p.id))).size+' players'} color="#34d399"/></div>
+      </div>
+    </React.Fragment>}
+  </div>
+}
+
+// ─── App ───
+function App(){
+  const [step,setStep]=useState('upload');
+  const [players,setPlayers]=useState([]);
+  const [entries,setEntries]=useState([]);
+  const [fileName,setFileName]=useState('');
+  const [optimalLineup,setOptimalLineup]=useState(null);
+  const [findingOptimal,setFindingOptimal]=useState(false);
+  const [settings,setSettings]=useState({lineupCount:5000,floorPct:94,noiseFactor:0.35,qbWrStack:false,bringBack:false,minSalary:49000,simCount:1000,fieldSize:150,overlapPenalty:4});
+  const [lineups,setLineups]=useState([]);
+  const [generating,setGenerating]=useState(false);
+  const [genProgress,setGenProgress]=useState({count:0,attempts:0});
+  const [simResults,setSimResults]=useState(null);
+  const [simulating,setSimulating]=useState(false);
+  const [simProgress,setSimProgress]=useState(0);
+  const [portfolio,setPortfolio]=useState(null);
+
+  const projFloor=optimalLineup?(optimalLineup.projection*settings.floorPct)/100:0;
+
+  const handleFile=useCallback((name,text)=>{
+    setFileName(name);
+    const {entries:ent,players:pl}=parseCSV(text);
+    setPlayers(pl);setEntries(ent);setFindingOptimal(true);
+    setTimeout(()=>{const opt=findOptimalLineup(pl);setOptimalLineup(opt);setFindingOptimal(false)},50);
+  },[]);
+
+  return <div style={{minHeight:'100vh',color:'#fff',fontFamily:"'SF Mono','Fira Code','Cascadia Code',Consolas,monospace",background:'linear-gradient(135deg,#050a18 0%,#0a1628 50%,#0d0f1a 100%)'}}>
+    <Header fileName={fileName}/>
+    <StepNav step={step} setStep={setStep}/>
+    <main style={{maxWidth:1280,margin:'0 auto',padding:'16px'}}>
+      {step==='upload'&&<UploadStep players={players} entries={entries} fileName={fileName} optimalLineup={optimalLineup} findingOptimal={findingOptimal} onFile={handleFile} onNext={()=>setStep('configure')}/>}
+      {step==='configure'&&<ConfigureStep settings={settings} setSettings={setSettings} optimalLineup={optimalLineup} projFloor={projFloor} onNext={()=>setStep('generate')}/>}
+      {step==='generate'&&<GenerateStep players={players} settings={settings} optimalLineup={optimalLineup} projFloor={projFloor} lineups={lineups} setLineups={setLineups} generating={generating} setGenerating={setGenerating} genProgress={genProgress} setGenProgress={setGenProgress} onNext={()=>setStep('simulate')}/>}
+      {step==='simulate'&&<SimulateStep players={players} lineups={lineups} settings={settings} simResults={simResults} setSimResults={setSimResults} simulating={simulating} setSimulating={setSimulating} simProgress={simProgress} setSimProgress={setSimProgress} onNext={()=>setStep('optimize')}/>}
+      {step==='optimize'&&<OptimizeStep simResults={simResults} entries={entries} settings={settings} portfolio={portfolio} setPortfolio={setPortfolio}/>}
+    </main>
+  </div>
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
